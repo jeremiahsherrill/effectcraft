@@ -3,6 +3,7 @@
 
 use effectcraft_keyframe::Value as KV;
 use effectcraft_project::{FrameBlend, ItemKind, MatteKind, Quality, Sampling};
+use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use crate::{EngineError, Event, Session};
@@ -49,6 +50,65 @@ fn layer_quality_sampling_frame_blending_and_undo() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(layer(&s, a).switches.frame_blend, FrameBlend::Off);
     assert!(s.execute("layer.quality", json!({"quality": "fancy"})).is_err());
+}
+
+/// `layer.sampling {toggle}` (Alt+B, Alt+Shift+B): layers that all have the sampling already get
+/// the other one; without `toggle` it is only set.
+#[test]
+fn layer_sampling_toggles_when_every_layer_has_it() {
+    let mut s = comp();
+    let a = solid(&mut s, "#ff0000");
+    let b = solid(&mut s, "#00ff00");
+    let sampling = |s: &Session| [layer(s, a).switches.sampling, layer(s, b).switches.sampling];
+    let bicubic = json!({"layers": [a, b], "sampling": "bicubic", "toggle": true});
+    s.execute("layer.sampling", bicubic.clone()).unwrap();
+    assert_eq!(sampling(&s), [Sampling::Bicubic; 2]);
+    s.execute("layer.sampling", bicubic.clone()).unwrap();
+    assert_eq!(sampling(&s), [Sampling::Bilinear; 2]);
+    s.execute("layer.sampling", json!({"layers": [a, b], "sampling": "bilinear", "toggle": true})).unwrap();
+    assert_eq!(sampling(&s), [Sampling::Bicubic; 2]);
+    // Mixed layers all get the one asked for.
+    s.execute("layer.sampling", json!({"layers": [a], "sampling": "bilinear"})).unwrap();
+    s.execute("layer.sampling", bicubic).unwrap();
+    assert_eq!(sampling(&s), [Sampling::Bicubic; 2]);
+    // Without `toggle` it stays.
+    s.execute("layer.sampling", json!({"layers": [a, b], "sampling": "bicubic"})).unwrap();
+    assert_eq!(sampling(&s), [Sampling::Bicubic; 2]);
+}
+
+/// `layer.setSwitch {others: true}` (Alt-click on an A/V feature): the layer stands alone, the
+/// other layers come back the next time.
+#[test]
+fn set_switch_others() {
+    let mut s = comp();
+    let a = solid(&mut s, "#ff0000");
+    let b = solid(&mut s, "#00ff00");
+    let c = solid(&mut s, "#0000ff");
+    let get = |s: &Session, f: fn(&effectcraft_project::Layer) -> bool| [a, b, c].map(|l| f(&layer(s, l)));
+    s.execute("layer.setSwitch", json!({"layers": [b], "switch": "video", "value": false})).unwrap();
+    // B is hidden: it is shown, alone; then the others come back; one undo step each.
+    s.execute("layer.setSwitch", json!({"layers": [b], "switch": "video", "others": true})).unwrap();
+    assert_eq!(get(&s, |l| l.switches.video), [false, true, false]);
+    s.execute("layer.setSwitch", json!({"layers": [b], "switch": "video", "others": true})).unwrap();
+    assert_eq!(get(&s, |l| l.switches.video), [true; 3]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(get(&s, |l| l.switches.video), [false, true, false]);
+    // Solo.
+    s.execute("layer.setSwitch", json!({"layers": [a], "switch": "solo", "value": true})).unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [c], "switch": "solo", "others": true})).unwrap();
+    assert_eq!(get(&s, |l| l.switches.solo), [false, false, true]);
+    // Lock: the layer stays unlocked and the others lock, then unlock.
+    s.execute("layer.setSwitch", json!({"layers": [a], "switch": "lock", "others": true})).unwrap();
+    assert_eq!(get(&s, |l| l.switches.locked), [false, true, true]);
+    s.execute("layer.setSwitch", json!({"layers": [a], "switch": "lock", "others": true})).unwrap();
+    assert_eq!(get(&s, |l| l.switches.locked), [false; 3]);
+    // A track matte keeps its video off.
+    s.execute("layer.setTrackMatte", json!({"layer": b, "matte": a})).unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [a], "switch": "video", "value": false})).unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [c], "switch": "video", "others": true})).unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [c], "switch": "video", "others": true})).unwrap();
+    assert_eq!(get(&s, |l| l.switches.video), [false, true, true]);
+    assert!(s.execute("layer.setSwitch", json!({"layers": [c], "switch": "nope", "others": true})).is_err());
 }
 
 #[test]
@@ -101,6 +161,152 @@ fn transform_dialog_values_and_center_anchor() {
 
     s.execute("layer.autoOrient", json!({"mode": "alongPath"})).unwrap();
     assert_eq!(layer(&s, a).auto_orient, effectcraft_project::AutoOrient::AlongPath);
+}
+
+/// Inclusive bounds of samples whose alpha is above one half, plus the frame size and the count.
+fn opaque_bounds(s: &Session, t: Tick) -> (u32, u32, i64, i64, i64, i64, u32) {
+    let img = s.render(s.active_comp_id().unwrap(), t, Default::default());
+    let mut n = 0u32;
+    let mut x0 = i64::MAX;
+    let mut y0 = i64::MAX;
+    let mut x1 = i64::MIN;
+    let mut y1 = i64::MIN;
+    for y in 0..img.height as i64 {
+        for x in 0..img.width as i64 {
+            if img.get(x, y)[3] > 0.5 {
+                n += 1;
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    (img.width, img.height, x0, y0, x1, y1, n)
+}
+
+#[test]
+fn separated_position_follows_canvas_resize_and_crop() {
+    let square = |separated: bool| {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "Test", "width": 100, "height": 100, "frameRate": 10, "duration": 2})).unwrap();
+        let a = s.execute("layer.newSolid", json!({"name": "Square", "color": "#ffffff", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setTransform", json!({"layer": a, "prop": "position", "value": [40, 50]})).unwrap();
+        if separated {
+            s.execute("prop.separateDimensions", json!({"layer": a, "value": true})).unwrap();
+        }
+        (s, a)
+    };
+    let placed = |s: &Session, a: u64, t: f64, x: f64, y: f64| {
+        let l = layer(s, a);
+        let tr = l.transform().unwrap();
+        let at = Tick::from_seconds_f64(t);
+        if tr.get("positionX").is_some() {
+            assert!((tr.get("positionX").unwrap().value_at(at).as_f64() - x).abs() < 1e-6);
+            assert!((tr.get("positionY").unwrap().value_at(at).as_f64() - y).abs() < 1e-6);
+        }
+        let p = tr.get("position").unwrap().value_at(at).as_vec3();
+        assert!((p[0] - x).abs() < 1e-6 && (p[1] - y).abs() < 1e-6, "combined {p:?}");
+    };
+
+    let (mut combined, a) = square(false);
+    let (mut separated, b) = square(true);
+    assert_eq!(opaque_bounds(&combined, Tick::ZERO), opaque_bounds(&separated, Tick::ZERO));
+    combined.execute("comp.settings", json!({"width": 200})).unwrap();
+    separated.execute("comp.settings", json!({"width": 200})).unwrap();
+    placed(&separated, b, 0.0, 90.0, 50.0);
+    placed(&combined, a, 0.0, 90.0, 50.0);
+    assert_eq!(opaque_bounds(&separated, Tick::ZERO), (200, 100, 85, 45, 94, 54, 100));
+    assert_eq!(opaque_bounds(&combined, Tick::ZERO), opaque_bounds(&separated, Tick::ZERO));
+
+    let (mut separated, b) = square(true);
+    separated.execute("view.setRegionOfInterest", json!({"rect": [10, 20, 70, 70]})).unwrap();
+    separated.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    placed(&separated, b, 0.0, 30.0, 30.0);
+    assert_eq!(opaque_bounds(&separated, Tick::ZERO), (70, 70, 25, 25, 34, 34, 100));
+
+    let (mut separated, b) = square(true);
+    separated.execute("layer.select", json!({"layers": [b]})).unwrap();
+    separated.execute("comp.cropToLayerBounds", json!({})).unwrap();
+    let bounds = opaque_bounds(&separated, Tick::ZERO);
+    assert_eq!((bounds.0, bounds.1, bounds.6), (10, 10, 100));
+    assert!(bounds.2 == 0 && bounds.3 == 0, "the square fills the cropped frame: {bounds:?}");
+
+    // Two Position keys keep their spacing after the same canvas offset.
+    let (mut separated, b) = square(true);
+    separated.execute("edit.undo", json!({})).unwrap();
+    separated.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "time": 0, "value": [40, 50]})).unwrap();
+    separated.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "time": 1, "value": [60, 50]})).unwrap();
+    separated.execute("prop.separateDimensions", json!({"layer": b, "value": true})).unwrap();
+    separated.execute("comp.settings", json!({"width": 200})).unwrap();
+    placed(&separated, b, 0.0, 90.0, 50.0);
+    placed(&separated, b, 1.0, 110.0, 50.0);
+    assert_eq!(opaque_bounds(&separated, Tick::ZERO).2, 85);
+    assert_eq!(opaque_bounds(&separated, Tick::from_seconds_f64(1.0)).2, 105);
+
+    let (mut separated, b) = square(true);
+    separated.execute("edit.undo", json!({})).unwrap();
+    separated.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "time": 0, "value": [40, 50]})).unwrap();
+    separated.execute("prop.addKey", json!({"layer": b, "path": "transform/position", "time": 1, "value": [60, 50]})).unwrap();
+    separated.execute("prop.separateDimensions", json!({"layer": b, "value": true})).unwrap();
+    separated.execute("view.setRegionOfInterest", json!({"rect": [10, 20, 70, 70]})).unwrap();
+    separated.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    placed(&separated, b, 0.0, 30.0, 30.0);
+    placed(&separated, b, 1.0, 50.0, 30.0);
+    assert_eq!(opaque_bounds(&separated, Tick::ZERO), (70, 70, 25, 25, 34, 34, 100));
+    assert_eq!(opaque_bounds(&separated, Tick::from_seconds_f64(1.0)), (70, 70, 45, 25, 54, 34, 100));
+}
+
+/// Pixel-centre of the opaque samples, so a 10×10 solid centred on (11, 22) reports (11, 22).
+fn opaque_centroid(s: &Session) -> (f64, f64, u32) {
+    let img = s.render(s.active_comp_id().unwrap(), Tick::ZERO, Default::default());
+    let mut n = 0u32;
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    for y in 0..img.height {
+        for x in 0..img.width {
+            if img.get(x as i64, y as i64)[3] > 0.5 {
+                n += 1;
+                sx += x as f64 + 0.5;
+                sy += y as f64 + 0.5;
+            }
+        }
+    }
+    assert!(n > 0, "the layer rendered nothing");
+    (sx / n as f64, sy / n as f64, n)
+}
+
+#[test]
+fn separated_position_set_transform_moves_the_layer() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Scene", "width": 100, "height": 100, "frameRate": 30, "duration": 2})).unwrap();
+    let a = s.execute("layer.newSolid", json!({"name": "Square", "color": "#ff0000", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
+    let (x, y, n) = opaque_centroid(&s);
+    assert_eq!(n, 100);
+    assert!((x - 50.0).abs() < 0.6 && (y - 50.0).abs() < 0.6, "starts centred, centroid ({x}, {y})");
+
+    s.execute("prop.separateDimensions", json!({"layer": a, "value": true})).unwrap();
+    s.execute("layer.setTransform", json!({"layers": [a], "prop": "position", "value": [11, 22]})).unwrap();
+    let l = layer(&s, a);
+    let tr = l.transform().unwrap();
+    assert!((tr.get("positionX").unwrap().value.as_f64() - 11.0).abs() < 1e-6);
+    assert!((tr.get("positionY").unwrap().value.as_f64() - 22.0).abs() < 1e-6);
+    assert_eq!(tr.get("position").unwrap().value, KV::Vec3([11.0, 22.0, 0.0]));
+    let (x, y, n) = opaque_centroid(&s);
+    assert_eq!(n, 100);
+    assert!((x - 11.0).abs() < 0.6 && (y - 22.0).abs() < 0.6, "separated position renders at ({x}, {y})");
+
+    s.execute("edit.undo", json!({})).unwrap();
+    let (x, y, _) = opaque_centroid(&s);
+    assert!((x - 50.0).abs() < 0.6 && (y - 50.0).abs() < 0.6, "undo puts it back at ({x}, {y})");
+
+    // Combined Position, the control, still moves.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(layer(&s, a).transform().unwrap().get("positionX").is_none());
+    s.execute("layer.setTransform", json!({"prop": "position", "value": [11, 22]})).unwrap();
+    let (x, y, n) = opaque_centroid(&s);
+    assert_eq!(n, 100);
+    assert!((x - 11.0).abs() < 0.6 && (y - 22.0).abs() < 0.6, "combined position renders at ({x}, {y})");
 }
 
 #[test]
@@ -199,6 +405,53 @@ fn keyframe_clipboard_paste_and_paste_reversed() {
     assert_eq!((keys[0].value.as_f64(), keys[1].value.as_f64()), (0.0, 100.0));
 }
 
+/// #493: Edit ▸ Copy with a property selected copies that property (its value when it isn't
+/// animated, its keys when it is), and Paste sets the same property of the selected layer, as
+/// in After Effects, instead of copying the whole layer.
+#[test]
+fn copy_a_selected_property_pastes_onto_the_same_property() {
+    let mut s = comp();
+    let a = solid(&mut s, "#ff0000");
+    let b = solid(&mut s, "#00ff00");
+    let n_layers = s.active_comp().unwrap().layers.len();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/position", "value": [10, 20]})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/rotation", "value": 30})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "path": "transform/position"})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    assert!(s.state.clipboard.is_empty(), "the layer isn't copied");
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    let undo = s.history.undo.len();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.len(), n_layers);
+    assert_eq!(layer(&s, b).props.prop("transform/position").unwrap().value.as_vec3()[..2], [10.0, 20.0]);
+    assert_eq!(layer(&s, b).props.prop("transform/rotation").unwrap().value.as_f64(), 0.0, "only the copied property");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_ne!(layer(&s, b).props.prop("transform/position").unwrap().value.as_vec3()[..2], [10.0, 20.0]);
+    assert_eq!(s.history.undo.len(), undo);
+    // The Transform group with an animated Opacity: its keys (at the CTI) and the other values,
+    // in one undo step.
+    s.execute("prop.toggleAnimation", json!({"layer": a, "path": "transform/opacity"})).unwrap();
+    s.execute("time.set", json!({"time": 1.0})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/opacity", "value": 0})).unwrap();
+    let transform = layer(&s, a).props.sub("transform").unwrap().uid;
+    s.execute("prop.select", json!({"layer": a, "prop": transform})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    let undo = s.history.undo.len();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(s.history.undo.len(), undo + 1);
+    let l = layer(&s, b);
+    let keys = &l.props.prop("transform/opacity").unwrap().keys;
+    assert_eq!(keys.len(), 2);
+    assert!((keys[0].time.seconds() - 2.0).abs() < 1e-6 && keys[1].value.as_f64() == 0.0);
+    assert_eq!(l.props.prop("transform/rotation").unwrap().value.as_f64(), 30.0);
+    assert_eq!(s.active_comp().unwrap().layers.len(), n_layers);
+    s.execute("edit.undo", json!({})).unwrap();
+    let l = layer(&s, b);
+    assert!(l.props.prop("transform/opacity").unwrap().keys.is_empty() && l.props.prop("transform/rotation").unwrap().value.as_f64() == 0.0);
+}
+
 #[test]
 fn property_links_and_expression_only() {
     let mut s = comp();
@@ -251,6 +504,82 @@ fn lift_and_extract_work_area() {
     let mut spans: Vec<(f64, f64)> = c.layers.iter().map(|l| (l.in_point.seconds(), l.out_point.seconds())).collect();
     spans.sort_by(|x, y| x.0.total_cmp(&y.0));
     assert!((spans[1].0 - 2.0).abs() < 1e-6 && (spans[1].1 - 8.0).abs() < 1e-6, "{spans:?}");
+}
+
+/// A project saved with an inverted work area (by an older build) is edited without a panic:
+/// `clamp` with crossed bounds would abort.
+#[test]
+fn an_inverted_saved_work_area_takes_an_end_edit() {
+    let mut s = comp();
+    let cid = s.active_comp_id().unwrap();
+    std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().work_area = (Tick::from_seconds_f64(9.0), Tick::from_seconds_f64(2.0));
+    s.execute("comp.workArea", json!({"end": 1.0})).unwrap();
+    s.execute("comp.workArea", json!({"start": 50.0})).unwrap();
+    let c = s.active_comp().unwrap();
+    assert!(c.work_area.0 >= Tick::ZERO && c.work_area.0 + c.frame_duration() <= c.work_area.1 && c.work_area.1 <= c.duration);
+}
+
+#[test]
+fn work_area_stays_ordered_when_the_start_passes_the_end() {
+    let ordered = |s: &Session| {
+        let c = s.active_comp().unwrap();
+        let fd = c.frame_duration();
+        assert!(c.duration >= fd, "duration {}", c.duration.seconds());
+        assert!(c.work_area.0 >= Tick::ZERO);
+        assert!(c.work_area.0 + fd <= c.work_area.1, "start {} end {}", c.work_area.0.seconds(), c.work_area.1.seconds());
+        assert!(c.work_area.1 <= c.duration);
+        (c.duration, c.work_area)
+    };
+    let one_frame_at_two = |s: &Session| {
+        let end = Tick::from_seconds_f64(2.0);
+        (end - s.active_comp().unwrap().frame_duration(), end)
+    };
+
+    let mut s = comp();
+    s.execute("comp.workArea", json!({"end": 2.0})).unwrap();
+    s.execute("comp.workArea", json!({"start": 8.0})).unwrap();
+    assert_eq!(ordered(&s).1, one_frame_at_two(&s));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(ordered(&s).1, (Tick::ZERO, Tick::from_seconds_f64(2.0)));
+
+    s.execute("comp.workArea", json!({"start": 0.0, "end": 2.0})).unwrap();
+    s.execute("comp.trimToWorkArea", json!({})).unwrap();
+    assert_eq!(ordered(&s), (Tick::from_seconds_f64(2.0), (Tick::ZERO, Tick::from_seconds_f64(2.0))));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(ordered(&s).0, Tick::from_seconds_f64(10.0));
+
+    let mut s = comp();
+    s.execute("comp.workArea", json!({"start": 9.0, "end": 10.0})).unwrap();
+    let before = ordered(&s);
+    s.execute("comp.settings", json!({"duration": 2.0})).unwrap();
+    let (dur, wa) = ordered(&s);
+    assert_eq!(dur, Tick::from_seconds_f64(2.0));
+    assert_eq!(wa, one_frame_at_two(&s));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(ordered(&s), before);
+
+    let mut s = comp();
+    s.execute("comp.workArea", json!({"end": 2.0})).unwrap();
+    s.execute("time.set", json!({"time": 8.0})).unwrap();
+    s.execute("comp.workArea", json!({"set": "begin"})).unwrap();
+    assert_eq!(ordered(&s).1, one_frame_at_two(&s));
+    let path = tmp("WorkArea.ecproj");
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    s.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!(ordered(&s).1, one_frame_at_two(&s));
+
+    // A project that already has an inverted interval must not trim into a negative duration.
+    let mut s = comp();
+    let cid = s.state.active_comp.unwrap();
+    {
+        let c = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap();
+        c.work_area = (Tick::from_seconds_f64(8.0), Tick::from_seconds_f64(2.0));
+    }
+    let err = s.execute("comp.trimToWorkArea", json!({})).unwrap_err();
+    assert!(err.to_string().contains("work area"), "{err}");
+    let c = s.active_comp().unwrap();
+    assert_eq!(c.duration, Tick::from_seconds_f64(10.0));
+    assert_eq!(c.work_area, (Tick::from_seconds_f64(8.0), Tick::from_seconds_f64(2.0)));
 }
 
 #[test]
@@ -765,6 +1094,57 @@ fn new_comp_from_selection_is_one_undo_step_with_the_dialog_options() {
 }
 
 #[test]
+fn comps_made_from_the_same_footage_get_numbered_names_as_duplicate_does() {
+    let mut s = Session::default();
+    let add = |s: &mut Session, name: &str, kind: ItemKind| std::sync::Arc::make_mut(&mut s.project).add_item(name, effectcraft_color::Label::None, None, kind);
+    let still = || {
+        ItemKind::Footage(effectcraft_project::Footage {
+            kind: effectcraft_project::FootageKind::Still,
+            width: 200,
+            height: 100,
+            has_video: true,
+            ..Default::default()
+        })
+    };
+    let clip = add(&mut s, "clip.png", still());
+    let other = add(&mut s, "other.png", still());
+    let make = |s: &mut Session, sel: Vec<effectcraft_project::ItemId>, p: Value| -> Vec<String> {
+        s.state.project_selection = sel;
+        let r = s.execute("file.newCompFromSelection", p).unwrap();
+        r["comps"].as_array().unwrap().iter().map(|c| s.project.item(effectcraft_project::ItemId(c.as_u64().unwrap())).unwrap().name.clone()).collect()
+    };
+    // The same footage again and again: "clip", "clip 2", "clip 3".
+    assert_eq!(make(&mut s, vec![clip], json!({})), ["clip"]);
+    assert_eq!(make(&mut s, vec![clip], json!({})), ["clip 2"]);
+    assert_eq!(make(&mut s, vec![clip], json!({})), ["clip 3"]);
+    // Several items at once (one comp each): every new comp has a name of its own.
+    assert_eq!(make(&mut s, vec![clip, other, clip], json!({})), ["clip 4", "other", "clip 5"]);
+    // One comp for all, named after the item it takes its settings from.
+    assert_eq!(make(&mut s, vec![clip, other], json!({"single": true})), ["clip 6"]);
+    assert_eq!(make(&mut s, vec![clip, other], json!({"single": true, "dimensionsFrom": 1})), ["other 2"]);
+    // Undo removes the latest comp and frees its name for the next one.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.find_by_name("other 2").is_none());
+    assert_eq!(make(&mut s, vec![other], json!({})), ["other 2"]);
+    // A solid or extensionless footage still names its own first comp; the second is numbered.
+    let red = add(&mut s, "Red Solid 1", ItemKind::Solid(effectcraft_project::Solid { color: [1.0, 0.0, 0.0], width: 100, height: 100, pixel_aspect: 1.0 }));
+    assert_eq!(make(&mut s, vec![red], json!({})), ["Red Solid 1"]);
+    assert_eq!(make(&mut s, vec![red], json!({})), ["Red Solid 2"]);
+    // Duplicate numbers its copies the same way, from the same helper.
+    let first = s.project.find_by_name("clip").unwrap().id;
+    s.state.project_selection = vec![first];
+    let r = s.execute("project.duplicate", json!({})).unwrap();
+    assert_eq!(s.project.item(effectcraft_project::ItemId(r["items"][0].as_u64().unwrap())).unwrap().name, "clip 7");
+    // A comp made from a comp doesn't take its source comp's name.
+    assert_eq!(make(&mut s, vec![first], json!({})), ["clip 8"]);
+    // Several comps at once are one undo step; undoing frees all their names.
+    assert_eq!(make(&mut s, vec![clip, other], json!({})), ["clip 9", "other 3"]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.find_by_name("clip 9").is_none() && s.project.find_by_name("other 3").is_none());
+    assert_eq!(make(&mut s, vec![other, clip], json!({})), ["other 3", "clip 9"]);
+}
+
+#[test]
 fn project_files_keep_their_format_warn_about_newer_versions_and_never_save_unreadable() {
     let mut s = comp();
     let a = solid(&mut s, "#ff0000");
@@ -1145,4 +1525,83 @@ fn duplicate_with_shape_items_selected_duplicates_them_in_place() {
     s.execute("layer.select", json!({"layers": [a]})).unwrap();
     s.execute("edit.duplicate", json!({})).unwrap();
     assert_eq!(s.active_comp().unwrap().layers.len(), n + 1);
+}
+
+/// The Interpret Footage form sends "Loop (times)" as a float (3.0); it must still be applied (#909).
+#[test]
+fn interpret_footage_loop_from_form_float() {
+    let mut s = comp();
+    let p = s.execute("file.importPlaceholder", json!({"name": "Shot", "width": 320, "height": 240})).unwrap()["item"].as_u64().unwrap();
+    s.state.project_selection = vec![effectcraft_project::ItemId(p)];
+    s.execute("file.interpretFootage", json!({"loop": 3.0})).unwrap();
+    match &s.project.item(effectcraft_project::ItemId(p)).unwrap().kind {
+        ItemKind::Footage(f) => assert_eq!(f.loop_count, 3),
+        _ => panic!(),
+    }
+}
+
+/// Looped video footage lasts its loops: a 2 s clip looped 3 times is a 6 s layer, and a layer
+/// that ran to the clip's end is re-timed when the loop count changes (#1045).
+#[test]
+fn interpret_footage_loop_extends_video_layers() {
+    let mut s = comp();
+    let p = s.execute("file.importPlaceholder", json!({"name": "Clip", "width": 320, "height": 240, "duration": 2})).unwrap()["item"].as_u64().unwrap();
+    let before = s.execute("layer.addItem", json!({"item": p})).unwrap()["layer"].as_u64().unwrap();
+    s.state.project_selection = vec![effectcraft_project::ItemId(p)];
+    s.execute("file.interpretFootage", json!({"loop": 3.0})).unwrap();
+    let after = s.execute("layer.addItem", json!({"item": p})).unwrap()["layer"].as_u64().unwrap();
+    let out = |s: &Session, l: u64| s.active_comp().unwrap().layer(effectcraft_project::LayerId(l)).unwrap().out_point.seconds();
+    assert_eq!(out(&s, after), 6.0, "a new layer plays every loop");
+    assert_eq!(out(&s, before), 6.0, "a layer that ran to the clip's end still does");
+    assert_eq!(s.project.item(effectcraft_project::ItemId(p)).unwrap().duration(), Some(Tick::from_seconds_f64(6.0)));
+}
+
+#[test]
+fn percentage_guides_follow_the_comp_size() {
+    let mut s = comp();
+    s.execute("view.addGuide", json!({"orientation": "vertical", "position": 25, "percent": true})).unwrap();
+    s.execute("view.addPercentGuide", json!({"orientation": "horizontal"})).unwrap();
+    s.execute("view.addGuide", json!({"orientation": "vertical", "position": 100})).unwrap();
+    let c = s.active_comp().unwrap().clone();
+    assert!(c.guides[0].percent && c.guides[1].percent && !c.guides[2].percent);
+    assert_eq!((c.guides[0].px(c.width, c.height), c.guides[1].px(c.width, c.height)), (160.0, 180.0));
+    // A comp resize moves percentage guides with it and leaves pixel guides alone.
+    s.execute("comp.settings", json!({"width": 1280, "height": 720})).unwrap();
+    let c = s.active_comp().unwrap().clone();
+    assert_eq!((c.guides[0].px(c.width, c.height), c.guides[1].px(c.width, c.height), c.guides[2].px(c.width, c.height)), (320.0, 360.0, 100.0));
+    // Dragging keeps the unit: the position arrives in comp pixels.
+    s.execute("view.moveGuide", json!({"index": 0, "position": 640})).unwrap();
+    assert_eq!(s.active_comp().unwrap().guides[0].position, 50.0);
+    // Snapping sees the pixel position.
+    let c = s.active_comp().unwrap().clone();
+    assert!(c.guides.iter().any(|g| g.percent && g.vertical && g.px(c.width, c.height) == 640.0));
+    // Converting keeps the guide where it is, and undoes in one step.
+    s.execute("view.convertGuides", json!({"to": "pixels"})).unwrap();
+    let g = s.active_comp().unwrap().guides.clone();
+    assert!(g.iter().all(|g| !g.percent));
+    assert_eq!((g[0].position, g[1].position), (640.0, 360.0));
+    s.execute("view.convertGuides", json!({"to": "percent", "index": 2})).unwrap();
+    assert_eq!(s.active_comp().unwrap().guides[2].position, 100.0 / 1280.0 * 100.0);
+    s.undo();
+    assert!(!s.active_comp().unwrap().guides[2].percent);
+    assert!(s.execute("view.convertGuides", json!({"to": "furlongs"})).is_err());
+    assert!(s.execute("view.convertGuides", json!({"index": 9})).is_err());
+    // A crop keeps percentage guides where they were on the image.
+    s.execute("view.convertGuides", json!({"to": "percent"})).unwrap();
+    s.execute("view.setRegionOfInterest", json!({"rect": [320, 0, 640, 720]})).unwrap();
+    s.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    let c = s.active_comp().unwrap();
+    assert!((c.guides[0].px(c.width, c.height) - 320.0).abs() < 1e-9, "640 - 320 crop offset");
+}
+
+#[test]
+fn old_guides_load_as_pixel_guides_and_percent_round_trips() {
+    let old: effectcraft_project::Guide = serde_json::from_str(r#"{"vertical":true,"position":12.5}"#).unwrap();
+    assert!(!old.percent);
+    assert!(!serde_json::to_string(&old).unwrap().contains("percent"), "pixel guides stay in the old shape");
+    let g = effectcraft_project::Guide { vertical: false, position: 10.0, percent: true };
+    let back: effectcraft_project::Guide = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+    assert_eq!(back, g);
+    // A zero-sized comp never divides by zero.
+    assert!(g.px(0, 0).is_finite());
 }
